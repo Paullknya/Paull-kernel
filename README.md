@@ -11,4 +11,4 @@
 > 
 ════════════════════════════════════════════════════
       
- link on AXonOS-kernel reposytory: [![AXonOS]([https://img.shields.io/badge/license-MIT-blue?style=flat-square](https://github.com/Paullknya/AXonOS))]
+ link on AXonOS-kernel repository: [![AXonOS]([https://img.shields.io/badge/license-MIT-blue?style=flat-square](https://github.com/Paullknya/AXonOS))]
