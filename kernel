@@ -1,44 +1,30 @@
-; ============================================================
-; kernel.asm – ядро shipOS с поддержкой Ring 3 и системным вызовом exit
-; ============================================================
 [bits 32]
 [org 0x10000]
 
-; ------------------------------------------------------------
-;  Расширенная GDT (добавляем сегменты Ring 3 и TSS)
-; ------------------------------------------------------------
+; ----- GDT (расширенная: Ring0 и Ring3, TSS) -----
 align 4
 gdt:
     dq 0
-    ; 0x08 – code Ring0
-    dw 0xFFFF, 0x0000, 0x9A00, 0x00CF
-    ; 0x10 – data Ring0
-    dw 0xFFFF, 0x0000, 0x9200, 0x00CF
-    ; 0x1B – code Ring3 (DPL=3)
-    dw 0xFFFF, 0x0000, 0xFA00, 0x00CF
-    ; 0x23 – data Ring3 (DPL=3)
-    dw 0xFFFF, 0x0000, 0xF200, 0x00CF
-    ; 0x28 – TSS (заполним позже)
-    dw 0, 0, 0, 0
+    dw 0xFFFF, 0x0000, 0x9A00, 0x00CF   ; 0x08 code Ring0
+    dw 0xFFFF, 0x0000, 0x9200, 0x00CF   ; 0x10 data Ring0
+    dw 0xFFFF, 0x0000, 0xFA00, 0x00CF   ; 0x1B code Ring3
+    dw 0xFFFF, 0x0000, 0xF200, 0x00CF   ; 0x23 data Ring3
+    dw 0, 0, 0, 0                        ; 0x28 TSS (заполним позже)
 gdt_end:
 
 gdt_desc:
     dw gdt_end - gdt - 1
     dd gdt
 
-; ------------------------------------------------------------
-; TSS (Task State Segment)
-; ------------------------------------------------------------
+; ----- TSS (Task State Segment) -----
 tss:
     dd 0                ; link
     dd 0                ; esp0 (заполняется ядром)
-    dd 0x10             ; ss0 (сегмент данных Ring0)
-    times 16 dd 0       ; остальное не нужно
+    dd 0x10             ; ss0
+    times 16 dd 0
 tss_end:
 
-; ------------------------------------------------------------
-; IDT и обработчик int 0x80
-; ------------------------------------------------------------
+; ----- IDT (Interrupt Descriptor Table) -----
 idt_start:
     times 256 * 8 db 0
 idt_end:
@@ -62,44 +48,75 @@ set_gate:
     pop edi
     ret
 
-; ----- обработчик int 0x80 -----
+; ----- Системные вызовы -----
 int80_handler:
     pushad
     push ds
     push es
-
-    cmp eax, 1          ; номер системного вызова (1 = exit)
+    cmp eax, 0
+    je .sys_write
+    cmp eax, 1
     je .sys_exit
+    cmp eax, 2
+    je .sys_getchar
+    jmp .done
 
-    jmp .invalid
+.sys_write:
+    mov esi, ebx
+    mov edi, [cursor_pos]
+    shl edi, 1
+    add edi, 0xB8000
+    mov ah, 0x07
+.write_loop:
+    test ecx, ecx
+    jz .write_done
+    lodsb
+    cmp al, 0x0A
+    je .write_newline
+    stosw
+    inc dword [cursor_pos]
+    dec ecx
+    jmp .write_loop
+.write_newline:
+    push eax ebx edx
+    mov eax, [cursor_pos]
+    mov ebx, 80
+    xor edx, edx
+    div ebx
+    mov eax, 80
+    sub eax, edx
+    add [cursor_pos], eax
+    pop edx ebx eax
+    dec ecx
+    jmp .write_loop
+.write_done:
+    jmp .done
 
 .sys_exit:
-    ; возвращаемся в ядро (Ring 0)
     call return_to_kernel
     jmp .done
 
-.invalid:
+.sys_getchar:
+    push ebx
+.getchar_wait:
+    in al, 0x60
+    test al, 0x80
+    jnz .getchar_wait
+    mov ebx, scancode_table
+    xlat
+    cmp al, 0
+    je .getchar_wait
+    movzx eax, al
+    pop ebx
+    jmp .done
+
 .done:
     pop es
     pop ds
     popad
     iret
 
-; ----- возврат в основное ядро (после завершения программы в Ring 3) -----
-return_to_kernel:
-    ; переключаемся обратно на стек ядра
-    mov ax, 0x10
-    mov ds, ax
-    mov es, ax
-    mov ss, ax
-    mov esp, kernel_stack_top
-
-    ; переходим в главный цикл оболочки (бесконечный)
-    jmp main_loop
-
-; ------------------------------------------------------------
-; Инициализация PIC
-; ------------------------------------------------------------
+; ----- Инициализация PIC (IRQ1) -----
 init_pic:
     mov al, 0x11
     out 0x20, al
@@ -115,182 +132,173 @@ init_pic:
     mov al, 0x01
     out 0x21, al
     out 0xA1, al
-    mov al, 0xFD   ; разрешить только клавиатуру (IRQ1)
+    mov al, 0xFD   ; разрешить IRQ1 (клавиатура)
     out 0x21, al
     mov al, 0xFF
     out 0xA1, al
     ret
 
-; ------------------------------------------------------------
-; Инициализация IDT и установка обработчиков
-; ------------------------------------------------------------
 init_idt:
-    ; клавиатура (вектор 33)
     mov eax, keyboard_handler
     mov ebx, 33
     call set_gate
-
-    ; системный вызов (вектор 0x80)
     mov eax, int80_handler
     mov ebx, 0x80
     call set_gate
-
     lidt [idt_desc]
     ret
 
-; ------------------------------------------------------------
-; Переключение в Ring 3 и запуск тестовой программы
-; ------------------------------------------------------------
-enter_ring3:
-    ; сохраняем текущий стек в TSS.esp0
-    mov dword [tss + 4], esp
-
-    ; подготавливаем стек для iret
-    push dword 0x23          ; SS (data Ring3)
-    push dword ring3_stack + 4096   ; ESP
-    pushfd
-    pop eax
-    or eax, 0x200            ; IF=1
-    push eax
-    push dword 0x1B          ; CS (code Ring3)
-    push dword ring3_code    ; EIP
-    iret
-
-; ----- стек для Ring 3 -----
-ring3_stack:
-    times 4096 db 0
-
-; ----- простая программа в Ring 3 (вызывает exit и завершается) -----
-ring3_code:
-    mov eax, 1          ; sys_exit
-    int 0x80
-    ; сюда никогда не попадём
-
-; ============================================================
-; Ваш существующий код (видео, клавиатура, последовательности)
-; ============================================================
-; ------------------------------------------------------------
+; ----- Видео -----
 init_video:
     mov edi, 0xB8000
     mov ecx, 2000
     mov eax, 0x0720
     rep stosw
-    mov dword [cursor_pos], 960
-    mov esi, msg_welcome
-    call print_string
+    mov dword [cursor_pos], 0
     ret
 
-print_string:
-    push eax
-    push edi
-    push esi
-.loop:
-    lodsb
-    test al, al
-    jz .done
+putchar:
+    push edi eax
     mov edi, [cursor_pos]
     shl edi, 1
     add edi, 0xB8000
     mov ah, 0x07
     stosw
     inc dword [cursor_pos]
-    jmp .loop
-.done:
-    pop esi
-    pop edi
-    pop eax
+    pop eax edi
     ret
 
-; ------------------------------------------------------------
-; Обработчик клавиатуры (ваш код с hew, bye, tu + F1 для переключения в Ring 3)
-; ------------------------------------------------------------
+print_string:
+    pusha
+.l:
+    lodsb
+    test al, al
+    jz .d
+    call putchar
+    jmp .l
+.d:
+    popa
+    ret
+
+newline:
+    push eax ebx edx
+    mov eax, [cursor_pos]
+    mov ebx, 80
+    xor edx, edx
+    div ebx
+    mov eax, 80
+    sub eax, edx
+    add [cursor_pos], eax
+    pop edx ebx eax
+    ret
+
+; ----- Таблица скан-кодов -----
+scancode_table:
+    db 0,0,'1','2','3','4','5','6','7','8','9','0','-','=',0,0
+    db 'q','w','e','r','t','y','u','i','o','p','[',']',0,0,'a','s'
+    db 'd','f','g','h','j','k','l',';',"'",'`',0,'\\','z','x','c','v'
+    db 'b','n','m',',','.','/',0,'*',0,' ',0,0,0,0,0,0
+    times 128 - ($ - scancode_table) db 0
+
+; ----- Буфер команд и пароль -----
+cmd_buffer:    times 64 db 0
+cmd_len:       dd 0
+password_mode: dd 0
+pending_cmd:   dd 0
+enter_pressed: dd 0
+
+admin_pass:    db "admin", 0
+pass_prompt:   db "[sudo] password: ", 0
+pass_fail:     db "Sorry, try again.", 0xA, 0
+unknown_cmd:   db "Unknown command.", 0xA, 0
+prompt_msg:    db "AxonOS> ", 0
+welcome_msg:   db "AxonOS 32-bit kernel ready.", 0xA, 0
+
+; ----- Обновление последовательностей (hew/bye/tu) – опционально, можно убрать -----
+; (оставим заглушки, чтобы не ломать компиляцию)
+update_sequences:
+    ret
+erase_sequence:
+    ret
+
+; ----- Обработчик клавиатуры -----
 keyboard_handler:
     pushad
     push ds
     push es
+    mov ax, 0x1000
+    mov ds, ax
+    mov ax, 0xB800
+    mov es, ax
 
     in al, 0x60
     test al, 0x80
     jnz .finish
 
-    ; ---- добавлено: F1 (скан-код 0x3B) переключает в Ring 3 ----
+    ; F1 – переключение в Ring3 (демонстрация)
     cmp al, 0x3B
-    je .run_ring3
+    je .f1
 
     mov ebx, scancode_table
     xlat
     cmp al, 0
     je .finish
 
-    cmp al, ' '
-    jne .normal
+    ; Enter
+    cmp al, 0x0D
+    je .enter
 
-    cmp byte [ready_hew], 1
-    je  .do_hew
-    cmp byte [ready_bye], 1
-    je  .do_bye
-    cmp byte [ready_tu], 1
-    je  .do_tu
-    jmp .just_space
+    ; Backspace
+    cmp al, 0x08
+    je .backspace
 
-.do_hew:
-    mov ecx, 4
-    call erase_chars
-    mov esi, msg_hello
-    call print_string
-    call newline
-    mov byte [ready_hew], 0
-    mov byte [pos_hew], 0
+    ; Если режим пароля, добавляем в буфер пароля (звёздочки)
+    cmp dword [password_mode], 1
+    je .add_to_pass
+
+    ; Обычный режим – добавляем в командный буфер
+    jmp .add_to_cmd
+
+.add_to_pass:
+    mov ebx, [cmd_len]
+    cmp ebx, 63
+    jae .finish
+    mov edi, cmd_buffer
+    add edi, ebx
+    stosb
+    inc dword [cmd_len]
+    ; выводим '*'
+    push eax
+    mov al, '*'
+    call putchar
+    pop eax
     jmp .finish
 
-.do_bye:
-    mov ecx, 4
-    call erase_chars
-    mov esi, msg_bye
-    call print_string
-    call newline
-    mov byte [ready_bye], 0
-    mov byte [pos_bye], 0
+.add_to_cmd:
+    mov ebx, [cmd_len]
+    cmp ebx, 63
+    jae .finish
+    mov edi, cmd_buffer
+    add edi, ebx
+    stosb
+    inc dword [cmd_len]
+    call putchar
     jmp .finish
 
-.do_tu:
-    mov ecx, 3
-    call erase_chars
-    mov esi, msg_tu
-    call print_string
-    call newline
-    mov byte [ready_tu], 0
-    mov byte [pos_tu], 0
+.backspace:
+    cmp dword [cmd_len], 0
+    je .finish
+    dec dword [cmd_len]
+    call backspace_char
     jmp .finish
 
-.run_ring3:
-    call enter_ring3      ; переключение в Ring 3
-    ; после возврата (sys_exit) сюда не попадём
+.enter:
+    mov dword [enter_pressed], 1
     jmp .finish
 
-.just_space:
-    mov edi, [cursor_pos]
-    shl edi, 1
-    add edi, 0xB8000
-    mov ah, 0x07
-    mov al, ' '
-    stosw
-    inc dword [cursor_pos]
-    jmp .check_cursor
-
-.normal:
-    call update_sequences
-    mov edi, [cursor_pos]
-    shl edi, 1
-    add edi, 0xB8000
-    mov ah, 0x07
-    stosw
-    inc dword [cursor_pos]
-
-.check_cursor:
-    cmp dword [cursor_pos], 2000
-    jl .finish
-    dec dword [cursor_pos]
+.f1:
+    call enter_ring3
+    jmp .finish
 
 .finish:
     mov al, 0x20
@@ -300,11 +308,8 @@ keyboard_handler:
     popad
     iret
 
-; ------------------------------------------------------------
-; erase_chars, newline, update_sequences (ваши, без изменений)
-; ------------------------------------------------------------
-erase_chars:
-.erase_loop:
+backspace_char:
+    push edi
     cmp dword [cursor_pos], 0
     je .done
     dec dword [cursor_pos]
@@ -313,128 +318,230 @@ erase_chars:
     add edi, 0xB8000
     mov ax, 0x0720
     stosw
-    loop .erase_loop
 .done:
+    pop edi
     ret
 
-newline:
-    push eax
-    push ebx
-    push edx
-    mov eax, [cursor_pos]
-    mov ebx, 80
-    xor edx, edx
-    div ebx
-    mov eax, 80
-    sub eax, edx
-    add [cursor_pos], eax
-    pop edx
-    pop ebx
+; ----- Переключение в Ring3 (демо) -----
+enter_ring3:
+    mov dword [tss + 4], esp
+    push dword 0x23
+    push dword ring3_stack + 4096
+    pushfd
     pop eax
+    or eax, 0x200
+    push eax
+    push dword 0x1B
+    push dword ring3_code
+    iret
+
+ring3_stack: times 4096 db 0
+ring3_code:
+    mov esi, ring3_msg
+    call print_string_ring3
+    mov eax, 1
+    int 0x80
+ring3_msg: db "Ring3 active. Type 'exit' to return.", 0xA, 0
+print_string_ring3:
+    pusha
+    mov edi, [cursor_pos]
+    shl edi, 1
+    add edi, 0xB8000
+.l:
+    lodsb
+    test al, al
+    jz .d
+    mov ah, 0x07
+    stosw
+    inc dword [cursor_pos]
+    jmp .l
+.d:
+    popa
     ret
 
-update_sequences:
-    push ebx
-
-    ; hew
-    mov bl, [pos_hew]
-    cmp bl, 3
-    je .skip_hew
-    mov ebx, seq_hew
-    add bl, [pos_hew]
-    cmp al, [ebx]
-    jne .reset_hew
-    inc byte [pos_hew]
-    cmp byte [pos_hew], 3
-    jne .skip_hew
-    mov byte [ready_hew], 1
-    jmp .skip_hew
-.reset_hew:
-    mov byte [pos_hew], 0
-    mov byte [ready_hew], 0
-.skip_hew:
-
-    ; bye
-    mov bl, [pos_bye]
-    cmp bl, 3
-    je .skip_bye
-    mov ebx, seq_bye
-    add bl, [pos_bye]
-    cmp al, [ebx]
-    jne .reset_bye
-    inc byte [pos_bye]
-    cmp byte [pos_bye], 3
-    jne .skip_bye
-    mov byte [ready_bye], 1
-    jmp .skip_bye
-.reset_bye:
-    mov byte [pos_bye], 0
-    mov byte [ready_bye], 0
-.skip_bye:
-
-    ; tu
-    mov bl, [pos_tu]
-    cmp bl, 2
-    je .skip_tu
-    mov ebx, seq_tu
-    add bl, [pos_tu]
-    cmp al, [ebx]
-    jne .reset_tu
-    inc byte [pos_tu]
-    cmp byte [pos_tu], 2
-    jne .skip_tu
-    mov byte [ready_tu], 1
-    jmp .skip_tu
-.reset_tu:
-    mov byte [pos_tu], 0
-    mov byte [ready_tu], 0
-.skip_tu:
-
-    pop ebx
+; ----- Обработка команд (вызывается из main_loop) -----
+clear_cmd_buffer:
+    mov dword [cmd_len], 0
+    mov edi, cmd_buffer
+    mov ecx, 64
+    xor al, al
+    rep stosb
     ret
 
-; ------------------------------------------------------------
-; Данные
-; ------------------------------------------------------------
-msg_welcome  db "shipOS 32-bit with keyboard", 0
-msg_hello    db "hello world", 0
-msg_bye      db "goodbye cruel world", 0
-msg_tu       db "Hello 231(tu)", 0
-seq_hew      db "hew", 0
-seq_bye      db "bye", 0
-seq_tu       db "tu", 0
+process_command:
+    ; завершаем строку нулём
+    mov ebx, cmd_buffer
+    mov ecx, [cmd_len]
+    mov byte [ebx+ecx], 0
+
+    ; пропускаем ведущие пробелы
+    mov esi, cmd_buffer
+.skip_spaces:
+    cmp byte [esi], ' '
+    jne .check
+    inc esi
+    jmp .skip_spaces
+.check:
+    ; команда "help"
+    mov edi, help_str
+    call strcmp
+    test eax, eax
+    jnz .help
+    ; "clear"
+    mov edi, clear_str
+    call strcmp
+    test eax, eax
+    jnz .clear
+    ; "sudo"
+    mov edi, sudo_str
+    call strcmp
+    test eax, eax
+    jnz .sudo
+    ; "exit"
+    mov edi, exit_str
+    call strcmp
+    test eax, eax
+    jnz .exit
+    jmp .unknown
+
+.help:
+    mov esi, help_msg
+    call print_string
+    jmp .done
+.clear:
+    call init_video
+    jmp .done
+.sudo:
+    ; после "sudo" должна быть подкоманда
+    add esi, 4
+    cmp byte [esi], ' '
+    jne .sudo_usage
+    inc esi
+    cmp byte [esi], 'r'
+    jne .sudo_usage
+    mov edi, reboot_str
+    call strcmp
+    test eax, eax
+    jnz .sudo_reboot
+.sudo_usage:
+    mov esi, sudo_usage_msg
+    call print_string
+    jmp .done
+.sudo_reboot:
+    mov dword [password_mode], 1
+    mov dword [pending_cmd], 1
+    mov esi, pass_prompt
+    call print_string
+    jmp .clear_buffer
+.exit:
+    mov esi, exit_msg
+    call print_string
+    jmp .halt
+.unknown:
+    mov esi, unknown_cmd
+    call print_string
+    jmp .done
+
+.done:
+    call clear_cmd_buffer
+    mov esi, prompt_msg
+    call print_string
+    ret
+.clear_buffer:
+    call clear_cmd_buffer
+    mov esi, prompt_msg
+    call print_string
+    ret
+.halt:
+    cli
+    hlt
+    jmp $
+
+; ----- Проверка пароля (вызывается при enter_pressed и password_mode) -----
+verify_password:
+    mov ebx, cmd_buffer
+    mov ecx, [cmd_len]
+    mov byte [ebx+ecx], 0
+    mov esi, cmd_buffer
+    mov edi, admin_pass
+    call strcmp
+    test eax, eax
+    jnz .wrong
+    ; пароль верен – выполняем pending command
+    cmp dword [pending_cmd], 1
+    jne .done
+    call reboot
+.wrong:
+    mov esi, pass_fail
+    call print_string
+.done:
+    mov dword [password_mode], 0
+    mov dword [pending_cmd], 0
+    call clear_cmd_buffer
+    mov esi, prompt_msg
+    call print_string
+    ret
+
+; ----- Вспомогательные функции -----
+strcmp:
+    push esi edi
+    xor eax, eax
+.loop:
+    mov al, [esi]
+    mov bl, [edi]
+    cmp al, bl
+    jne .neq
+    test al, al
+    jz .eq
+    inc esi
+    inc edi
+    jmp .loop
+.eq:
+    mov eax, 1
+    pop edi esi
+    ret
+.neq:
+    xor eax, eax
+    pop edi esi
+    ret
+
+reboot:
+    mov al, 0xFE
+    out 0x64, al
+    jmp $
+
+return_to_kernel:
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov esp, kernel_stack_top
+    mov esi, prompt_msg
+    call print_string
+    jmp main_loop
+
+; ----- Данные -----
+help_str:    db "help", 0
+clear_str:   db "clear", 0
+sudo_str:    db "sudo", 0
+exit_str:    db "exit", 0
+reboot_str:  db "reboot", 0
+help_msg:    db "Available commands: help, clear, sudo reboot, exit", 0xA, 0
+sudo_usage_msg: db "usage: sudo reboot", 0xA, 0
+exit_msg:    db "System halted.", 0xA, 0
 
 cursor_pos   dd 0
-pos_hew      db 0
-ready_hew    db 0
-pos_bye      db 0
-ready_bye    db 0
-pos_tu       db 0
-ready_tu     db 0
+kernel_stack_bottom: times 4096 db 0
+kernel_stack_top equ kernel_stack_bottom + 4096
 
-scancode_table:
-    db 0, 0, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', 0, 0
-    db 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', 0, 0, 'a', 's'
-    db 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', "'", '`', 0, '\\', 'z', 'x', 'c', 'v'
-    db 'b', 'n', 'm', ',', '.', '/', 0, '*', 0, ' ', 0, 0, 0, 0, 0, 0
-    times 128 - ($ - scancode_table) db 0
-
-kernel_stack_top:
-    times 4096 db 0
-    dd 0        ; метка для вершины стека (используется в return_to_kernel)
-
-; ------------------------------------------------------------
-; Точка входа
-; ------------------------------------------------------------
+; ----- Точка входа -----
 start:
     call init_video
     call init_pic
     call init_idt
 
-    ; загружаем расширенную GDT и TSS
-    ; (переопределяем GDT, которую загрузил загрузчик)
+    ; загрузка расширенной GDT
     lgdt [gdt_desc]
-    ; заполняем дескриптор TSS в GDT
     mov eax, tss
     mov word [gdt + 0x28 + 0], (tss_end - tss - 1)
     mov word [gdt + 0x28 + 2], ax
@@ -443,19 +550,26 @@ start:
     mov byte [gdt + 0x28 + 5], 0x89
     mov byte [gdt + 0x28 + 6], 0
     mov byte [gdt + 0x28 + 7], ah
-
-    ; загружаем TSS
     mov ax, 0x28
     ltr ax
-
     sti
 
+    mov esi, welcome_msg
+    call print_string
+    mov esi, prompt_msg
+    call print_string
+
 main_loop:
-    ; здесь ядро ждёт команды (всё делает клавиатурный обработчик)
     hlt
+    cmp dword [enter_pressed], 1
+    jne main_loop
+    mov dword [enter_pressed], 0
+    cmp dword [password_mode], 1
+    je .verify
+    call process_command
+    jmp main_loop
+.verify:
+    call verify_password
     jmp main_loop
 
-; ------------------------------------------------------------
-; заполнение до 8 секторов (4096 байт) – обязательно, иначе образ не загрузится
-; ------------------------------------------------------------
-times 512*8 - ($-$$) db 0
+; размер ядра – не ограничиваем (загрузчик читает все сектора, файл может быть любого размера)
