@@ -1,4 +1,4 @@
-# 🧠 AXonOS
+# 🧠 Paull-Kernel-OS
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Latest Release](https://img.shields.io/github/v/release/Paullknya/AXonOS-kernel)](https://github.com/Paullknya/AXonOS-kernel/releases/latest)
