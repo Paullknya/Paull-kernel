@@ -1,11 +1,11 @@
-# 🧠 Paull‑kernel
+# 🧠 Snorkel-OS
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Latest Release](https://img.shields.io/github/v/release/Paullknya/Paull-kernel)](https://github.com/Paullknya/Paull-kernel/releases/latest)
 
 [![Typing SVG](https://readme-typing-svg.demolab.com?font=Fira+Code&pause=1000&color=00FF00&background=0D1117&width=500&lines=32-bit+x86+kernel+from+scratch;Protected+mode+%2B+syscalls;Rings+0%2F3+%2B+command+line;FAT32+and+multitasking+next)](https://git.io/typing-svg)
 
-**32‑bit x86 kernel from scratch**  
+**paull-kernel(kernel the Snorkel-OS) 32‑bit x86 kernel from scratch**  
 Protected mode, hardware interrupts, syscalls, rings 0/3, command line.
 
 ![Paull‑kernel shell](demo.gif)
